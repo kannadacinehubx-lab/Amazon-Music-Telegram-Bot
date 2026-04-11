@@ -22,31 +22,22 @@ import mongodb
 DOWNLOAD_DIR = "./downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# just a regular browser UA so requests don't get blocked immediately
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/134.0.0.0 Safari/537.36"
 )
 
-# covers all the amazon music regional domains we care about
 AMAZON_URL_RE = re.compile(
     r"https?://music\.amazon\.(in|com|co\.uk|de|jp|fr|ca|com\.au)/\S+"
 )
 
-
-# ── url helpers ──────────────────────────────────────────────────────────────
 
 def is_amazon_url(text: str) -> bool:
     return bool(AMAZON_URL_RE.search(text))
 
 
 def extract_asin(url: str) -> str:
-    """
-    Pull the track ASIN from an Amazon Music URL.
-    Amazon puts it either as a ?trackAsin= query param or somewhere in the path.
-    We check the query param first since that's always track-level.
-    """
     from urllib.parse import urlparse, parse_qs
 
     parsed = urlparse(url)
@@ -65,10 +56,6 @@ def extract_asin(url: str) -> str:
 
 
 def probe_audio(path: str) -> dict:
-    """
-    Run ffprobe on the file to get codec info.
-    We need this before decryption to know what extension to use on the output.
-    """
     result = subprocess.run(
         [
             "ffprobe", "-v", "quiet",
@@ -91,13 +78,7 @@ def probe_audio(path: str) -> dict:
     return streams[0]
 
 
-# ── api + download ───────────────────────────────────────────────────────────
-
 async def fetch_track_meta(asin: str) -> dict:
-    """
-    Ask the API for the stream URL and metadata for a given ASIN.
-    The API isn't always consistent with field names so we try a few variants.
-    """
     async with httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT}, timeout=30
     ) as client:
@@ -135,14 +116,9 @@ async def fetch_track_meta(asin: str) -> dict:
 
 
 async def download_track(meta: dict) -> dict:
-    """
-    Stream-download the track and decrypt it with ffmpeg if a key was provided.
-    Returns the local file path and some codec info for the caption.
-    """
     asin = meta["asin"]
     enc_path = os.path.join(DOWNLOAD_DIR, f"{asin}_enc.m4a")
 
-    # stream the download in chunks — avoids loading the whole thing into memory
     async with httpx.AsyncClient(
         headers={"User-Agent": USER_AGENT},
         timeout=120,
@@ -157,17 +133,13 @@ async def download_track(meta: dict) -> dict:
     if not os.path.exists(enc_path) or os.path.getsize(enc_path) == 0:
         raise RuntimeError("downloaded file is empty — the stream URL might be dead")
 
-    # windows-safe filename (linux doesn't care but better to be consistent)
     safe_name = re.sub(r'[\\/*?:"<>|]', "", f"{meta['artist']} - {meta['title']}")
 
-    # no decryption key = already a playable file, just rename and return
     if not meta["key"]:
         out_path = os.path.join(DOWNLOAD_DIR, f"{safe_name}.m4a")
         os.rename(enc_path, out_path)
         return {**meta, "path": out_path, "codec": "m4a", "bits": None, "rate": None}
 
-    # probe first so we know the actual codec before decrypting
-    # using get_running_loop() — get_event_loop() is deprecated inside async functions in 3.10+
     loop = asyncio.get_running_loop()
     stream_info = await loop.run_in_executor(None, probe_audio, enc_path)
 
@@ -175,7 +147,6 @@ async def download_track(meta: dict) -> dict:
     ext = "flac" if codec == "flac" else ("m4a" if codec in ("aac", "alac") else codec)
     out_path = os.path.join(DOWNLOAD_DIR, f"{safe_name}.{ext}")
 
-    # decrypt with ffmpeg
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-loglevel", "error",
         "-decryption_key", meta["key"].strip(),
@@ -208,7 +179,6 @@ async def download_track(meta: dict) -> dict:
 
 
 def cleanup(*paths):
-    """Delete temp files — silently ignore errors if something's already gone."""
     for p in paths:
         if p and os.path.exists(p):
             try:
@@ -216,8 +186,6 @@ def cleanup(*paths):
             except Exception:
                 pass
 
-
-# ── logging helpers ──────────────────────────────────────────────────────────
 
 def user_tag(user) -> str:
     return f"@{user.username}" if user.username else f"<code>{user.id}</code>"
@@ -297,8 +265,6 @@ async def log_download(bot: Client, user, track: dict, file_id: str = None) -> N
         print(f"[log] couldn't send download log: {e}")
 
 
-# ── handlers ─────────────────────────────────────────────────────────────────
-
 async def cmd_start(bot: Client, msg: Message):
     user = msg.from_user
 
@@ -366,7 +332,7 @@ async def handle_message(bot: Client, msg: Message):
         track = await download_track(meta)
 
         await status.edit_text("uploading...")
-        await asyncio.sleep(1.5)  # small buffer to avoid telegram flood limits
+        await asyncio.sleep(1.5)
 
         fmt = "FLAC 24bit / 192kHz" if track["codec"] == "flac" else track["codec"].upper()
         caption = (
@@ -386,7 +352,6 @@ async def handle_message(bot: Client, msg: Message):
 
         await status.delete()
 
-        # reuse the telegram file_id so we don't upload again to the log channel
         file_id = sent.audio.file_id if sent and sent.audio else None
         await log_download(bot, msg.from_user, track, file_id)
 
@@ -409,10 +374,11 @@ async def main():
         bot_token=config.BOT_TOKEN,
     )
 
-    bot.add_handler(MessageHandler(cmd_start, filters.command("start")))
+    # filters.private ensures the bot only responds in DMs , and if u want to work in the other places just remove the filters.private thats all
+    bot.add_handler(MessageHandler(cmd_start, filters.command("start") & filters.private))
     bot.add_handler(CallbackQueryHandler(cb_credits, filters.regex("^credits$")))
     bot.add_handler(CallbackQueryHandler(cb_dismiss, filters.regex("^dismiss$")))
-    bot.add_handler(MessageHandler(handle_message, filters.text & ~filters.command(["start"])))
+    bot.add_handler(MessageHandler(handle_message, filters.text & filters.private & ~filters.command(["start"])))
 
     await mongodb.connect()
     await bot.start()
